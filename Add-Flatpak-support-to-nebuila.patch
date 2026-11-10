@@ -1,0 +1,1073 @@
+From aaedf1bcbffde405f9e638e4de45744c3c746b96 Mon Sep 17 00:00:00 2001
+From: Nebula Flatpak <noreply@example.com>
+Date: Tue, 10 Nov 2026 21:10:48 +0100
+Subject: [PATCH] Add Flatpak support to Discover and Installed
+
+Flatpak apps are searched, listed, installed and removed alongside XBPS
+packages. They are stored internally as flatpak:<app-id> and routed to the
+flatpak CLI; the UI shows their friendly name and a Flatpak tag, and hides
+Hold for them. Support turns itself off when flatpak is not installed.
+
+Co-Authored-By: Claude Opus 5.5
+---
+ src/flatpak/mod.rs                | 505 ++++++++++++++++++++++++++++++
+ src/helpers.rs                    |  20 ++
+ src/main.rs                       |   1 +
+ src/spotlight/cache.rs            |   1 +
+ src/spotlight/refresh.rs          |   1 +
+ src/state/controller/app.rs       |  42 ++-
+ src/state/controller/discover.rs  |  12 +-
+ src/state/controller/installed.rs |  22 +-
+ src/types.rs                      |  16 +
+ src/xbps/commands.rs              |  71 ++++-
+ src/xbps/parser.rs                |   2 +
+ 11 files changed, 659 insertions(+), 34 deletions(-)
+ create mode 100644 src/flatpak/mod.rs
+
+diff --git a/src/flatpak/mod.rs b/src/flatpak/mod.rs
+new file mode 100644
+index 0000000..8101cf5
+--- /dev/null
++++ b/src/flatpak/mod.rs
+@@ -0,0 +1,505 @@
++//! Flatpak support.
++//!
++//! Flatpak applications live alongside XBPS packages in Nebula's lists. To keep
++//! the rest of the code base (which identifies packages by name) unchanged, a
++//! Flatpak app is stored with the name `flatpak:<app-id>`. The XBPS command
++//! wrappers check for that prefix and hand the work over to this module.
++//!
++//! Everything here shells out to the `flatpak` command line tool. If it is not
++//! installed, Flatpak support silently switches itself off.
++
++use std::collections::{HashMap, HashSet};
++use std::process::Command;
++
++use once_cell::sync::Lazy;
++
++use crate::details::{DiscoverDetail, InstalledDetail};
++use crate::types::{CommandResult, PackageInfo, lowercase_cache};
++
++pub(crate) const PREFIX: &str = "flatpak:";
++
++pub(crate) fn is_flatpak_name(name: &str) -> bool {
++    name.starts_with(PREFIX)
++}
++
++/// `flatpak:org.gimp.GIMP` -> `org.gimp.GIMP`; other names are returned as-is.
++pub(crate) fn strip_prefix(name: &str) -> &str {
++    name.strip_prefix(PREFIX).unwrap_or(name)
++}
++
++pub(crate) fn key_for(app_id: &str) -> String {
++    format!("{}{}", PREFIX, app_id)
++}
++
++/// Split a list of package names into (xbps, flatpak app ids).
++pub(crate) fn partition_names(names: &[String]) -> (Vec<String>, Vec<String>) {
++    let mut xbps = Vec::new();
++    let mut flatpak = Vec::new();
++    for name in names {
++        if is_flatpak_name(name) {
++            flatpak.push(strip_prefix(name).to_string());
++        } else {
++            xbps.push(name.clone());
++        }
++    }
++    (xbps, flatpak)
++}
++
++static AVAILABLE: Lazy<bool> = Lazy::new(|| {
++    Command::new("flatpak")
++        .arg("--version")
++        .output()
++        .map(|out| out.status.success())
++        .unwrap_or(false)
++});
++
++/// Whether the `flatpak` tool is installed on this system.
++pub(crate) fn is_available() -> bool {
++    *AVAILABLE
++}
++
++fn flatpak_command() -> Command {
++    let mut command = Command::new("flatpak");
++    // Output is parsed, so it must not be translated.
++    command.env("LC_ALL", "C");
++    command.env("LANG", "C");
++    command
++}
++
++fn run_capture(args: &[&str]) -> Result<CommandResult, String> {
++    let output = flatpak_command()
++        .args(args)
++        .output()
++        .map_err(|err| format!("Failed to launch flatpak: {}", err))?;
++    Ok(CommandResult {
++        code: output.status.code(),
++        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
++        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
++    })
++}
++
++fn new_package(
++    app_id: &str,
++    display_name: &str,
++    version: &str,
++    description: &str,
++    installed: bool,
++    origin: Option<String>,
++) -> PackageInfo {
++    let name = key_for(app_id);
++    let version = version.trim().to_string();
++    let description = description.trim().to_string();
++    let display_name = display_name.trim();
++    // Make the friendly name searchable/filterable too.
++    let searchable = if display_name.is_empty() {
++        description.clone()
++    } else {
++        format!("{} {}", display_name, description)
++    };
++    PackageInfo {
++        name_lower: lowercase_cache(&name),
++        version_lower: lowercase_cache(&version),
++        description_lower: lowercase_cache(&searchable),
++        name,
++        version,
++        description,
++        installed,
++        pinned: false,
++        previous_version: None,
++        download_size: None,
++        changelog: None,
++        download_bytes: None,
++        repository: origin.map(|o| format!("Flatpak ({})", o)),
++        build_date: None,
++        first_seen: None,
++        display_name: if display_name.is_empty() {
++            None
++        } else {
++            Some(display_name.to_string())
++        },
++    }
++}
++
++/// Split one line of tab-separated `flatpak --columns=` output.
++fn split_columns(line: &str) -> Vec<&str> {
++    line.split('\t').map(|c| c.trim()).collect()
++}
++
++fn looks_like_app_id(value: &str) -> bool {
++    // Reverse-DNS: at least two dots, no spaces.
++    !value.is_empty() && !value.contains(' ') && value.matches('.').count() >= 2
++}
++
++// ---------------------------------------------------------------------------
++// Search
++// ---------------------------------------------------------------------------
++
++const SEARCH_COLUMNS: &str = "--columns=application,name,description,version,remotes";
++
++pub(crate) fn parse_search_output(output: &str) -> Vec<PackageInfo> {
++    let mut seen = HashSet::new();
++    let mut packages = Vec::new();
++    for line in output.lines() {
++        let cols = split_columns(line);
++        if cols.len() < 2 {
++            continue;
++        }
++        let app_id = cols[0];
++        // Skips the header row (printed on a terminal) and "No matches found".
++        if !looks_like_app_id(app_id) {
++            continue;
++        }
++        if !seen.insert(app_id.to_string()) {
++            continue;
++        }
++        let display_name = cols.get(1).copied().unwrap_or("");
++        let description = cols.get(2).copied().unwrap_or("");
++        let version = cols.get(3).copied().unwrap_or("");
++        let origin = cols
++            .get(4)
++            .and_then(|r| r.split(',').next())
++            .map(|r| r.trim().to_string())
++            .filter(|r| !r.is_empty());
++        packages.push(new_package(
++            app_id,
++            display_name,
++            version,
++            description,
++            false,
++            origin,
++        ));
++    }
++    packages
++}
++
++/// Search the configured Flatpak remotes. Returns an empty list when Flatpak
++/// is not installed.
++pub(crate) fn search(query: &str) -> Result<Vec<PackageInfo>, String> {
++    if !is_available() {
++        return Ok(Vec::new());
++    }
++    let result = run_capture(&["search", SEARCH_COLUMNS, query])?;
++    if !result.success() {
++        return Err(result.stderr.trim().to_string());
++    }
++    Ok(parse_search_output(&result.stdout))
++}
++
++// ---------------------------------------------------------------------------
++// Installed apps
++// ---------------------------------------------------------------------------
++
++const LIST_COLUMNS: &str = "--columns=application,name,description,version,origin";
++
++pub(crate) fn parse_list_output(output: &str) -> Vec<PackageInfo> {
++    let mut seen = HashSet::new();
++    let mut packages = Vec::new();
++    for line in output.lines() {
++        let cols = split_columns(line);
++        if cols.is_empty() {
++            continue;
++        }
++        let app_id = cols[0];
++        if !looks_like_app_id(app_id) || !seen.insert(app_id.to_string()) {
++            continue;
++        }
++        let display_name = cols.get(1).copied().unwrap_or("");
++        let description = cols.get(2).copied().unwrap_or("");
++        let version = cols.get(3).copied().unwrap_or("");
++        let origin = cols.get(4).map(|o| o.to_string()).filter(|o| !o.is_empty());
++        packages.push(new_package(
++            app_id,
++            display_name,
++            version,
++            description,
++            true,
++            origin,
++        ));
++    }
++    packages
++}
++
++/// Installed Flatpak applications (user and system installations).
++pub(crate) fn list_installed() -> Result<Vec<PackageInfo>, String> {
++    if !is_available() {
++        return Ok(Vec::new());
++    }
++    let result = run_capture(&["list", "--app", LIST_COLUMNS])?;
++    if !result.success() {
++        return Err(result.stderr.trim().to_string());
++    }
++    Ok(parse_list_output(&result.stdout))
++}
++
++// ---------------------------------------------------------------------------
++// Install / uninstall
++// ---------------------------------------------------------------------------
++
++/// Find which remote provides `app_id` (first match wins).
++fn remote_for(app_id: &str) -> Option<String> {
++    let result = run_capture(&["search", "--columns=application,remotes", app_id]).ok()?;
++    if !result.success() {
++        return None;
++    }
++    result.stdout.lines().find_map(|line| {
++        let cols = split_columns(line);
++        if cols.first().copied() == Some(app_id) {
++            cols.get(1)
++                .and_then(|r| r.split(',').next())
++                .map(|r| r.trim().to_string())
++                .filter(|r| !r.is_empty())
++        } else {
++            None
++        }
++    })
++}
++
++/// Install a Flatpak app system-wide. Authorisation is handled by Flatpak
++/// itself through polkit, so no pkexec is needed.
++pub(crate) fn install(app_id: &str) -> Result<CommandResult, String> {
++    let remote = remote_for(app_id);
++    let mut args = vec!["install", "--system", "-y", "--noninteractive"];
++    if let Some(remote) = remote.as_deref() {
++        args.push(remote);
++    }
++    args.push(app_id);
++    run_capture(&args)
++}
++
++pub(crate) fn uninstall(app_ids: &[String]) -> Result<CommandResult, String> {
++    if app_ids.is_empty() {
++        return Ok(CommandResult {
++            code: Some(0),
++            stdout: String::new(),
++            stderr: String::new(),
++        });
++    }
++    let mut args: Vec<&str> = vec!["uninstall", "-y", "--noninteractive"];
++    args.extend(app_ids.iter().map(|s| s.as_str()));
++    run_capture(&args)
++}
++
++// ---------------------------------------------------------------------------
++// Details
++// ---------------------------------------------------------------------------
++
++#[derive(Default, Debug)]
++pub(crate) struct FlatpakInfo {
++    pub title: Option<String>,
++    pub summary: Option<String>,
++    pub fields: HashMap<String, String>,
++}
++
++/// Parse `flatpak info` / `flatpak remote-info` output:
++///
++/// ```text
++/// GIMP - Create images and edit photographs
++///
++///           ID: org.gimp.GIMP
++///      Version: 2.10.38
++///      License: GPL-3.0+
++///       Origin: flathub
++///    Installed: 1.2 GB
++/// ```
++pub(crate) fn parse_info_output(output: &str) -> FlatpakInfo {
++    let mut info = FlatpakInfo::default();
++    let mut saw_header = false;
++    for line in output.lines() {
++        let trimmed = line.trim();
++        if trimmed.is_empty() {
++            continue;
++        }
++        if !saw_header {
++            saw_header = true;
++            if !trimmed.contains(": ") || trimmed.contains(" - ") {
++                match trimmed.split_once(" - ") {
++                    Some((title, summary)) => {
++                        info.title = Some(title.trim().to_string());
++                        info.summary = Some(summary.trim().to_string());
++                    }
++                    None => info.title = Some(trimmed.to_string()),
++                }
++                continue;
++            }
++        }
++        if let Some((key, value)) = trimmed.split_once(':') {
++            let key = key.trim();
++            let value = value.trim();
++            if !key.is_empty() {
++                info.fields.insert(key.to_string(), value.to_string());
++            }
++        }
++    }
++    info
++}
++
++/// Convert "1.2 GB" / "350.5 MB" / "12 kB" (as printed by Flatpak) to bytes.
++pub(crate) fn parse_human_size(value: &str) -> Option<u64> {
++    let value = value.trim().replace('\u{a0}', " ");
++    let (number, unit) = match value.split_once(' ') {
++        Some((n, u)) => (n.trim(), u.trim()),
++        None => {
++            let idx = value.find(|c: char| c.is_alphabetic())?;
++            (value[..idx].trim(), value[idx..].trim())
++        }
++    };
++    let number: f64 = number.replace(',', ".").parse().ok()?;
++    let multiplier: f64 = match unit.to_ascii_lowercase().as_str() {
++        "b" | "bytes" | "byte" => 1.0,
++        "kb" => 1e3,
++        "mb" => 1e6,
++        "gb" => 1e9,
++        "tb" => 1e12,
++        "kib" => 1024.0,
++        "mib" => 1024.0 * 1024.0,
++        "gib" => 1024.0 * 1024.0 * 1024.0,
++        _ => return None,
++    };
++    Some((number * multiplier).round() as u64)
++}
++
++fn homepage_for(app_id: &str, origin: Option<&str>) -> Option<String> {
++    match origin {
++        Some(o) if o.eq_ignore_ascii_case("flathub") => {
++            Some(format!("https://flathub.org/apps/{}", app_id))
++        }
++        _ => None,
++    }
++}
++
++pub(crate) fn installed_detail(app_id: &str) -> Result<InstalledDetail, String> {
++    let result = run_capture(&["info", app_id])?;
++    if !result.success() {
++        return Err(result.stderr.trim().to_string());
++    }
++    let info = parse_info_output(&result.stdout);
++    let mut detail = InstalledDetail::default();
++    detail.long_description = info.summary.clone();
++    detail.license = info.fields.get("License").cloned();
++    detail.homepage = homepage_for(app_id, info.fields.get("Origin").map(|s| s.as_str()));
++    detail.maintainer = info
++        .fields
++        .get("Origin")
++        .map(|o| format!("Flatpak remote: {}", o));
++    if let Some(size) = info.fields.get("Installed") {
++        detail.download_bytes = parse_human_size(size);
++        detail.download_formatted = Some(size.clone());
++    }
++    Ok(detail)
++}
++
++pub(crate) fn discover_detail(app_id: &str) -> Result<DiscoverDetail, String> {
++    let remote = remote_for(app_id)
++        .ok_or_else(|| format!("Could not find \"{}\" in any Flatpak remote.", app_id))?;
++    let result = run_capture(&["remote-info", &remote, app_id])?;
++    if !result.success() {
++        return Err(result.stderr.trim().to_string());
++    }
++    let info = parse_info_output(&result.stdout);
++    let mut detail = DiscoverDetail::default();
++    detail.version = info.fields.get("Version").cloned();
++    detail.description = info.summary.clone();
++    detail.license = info.fields.get("License").cloned();
++    detail.repository = Some(format!("Flatpak ({})", remote));
++    detail.homepage = homepage_for(app_id, Some(&remote));
++    if let Some(size) = info.fields.get("Download") {
++        detail.download_bytes = parse_human_size(size);
++        detail.download = Some(size.clone());
++    }
++    Ok(detail)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn prefix_helpers() {
++        assert!(is_flatpak_name("flatpak:org.gimp.GIMP"));
++        assert!(!is_flatpak_name("gimp"));
++        assert_eq!(strip_prefix("flatpak:org.gimp.GIMP"), "org.gimp.GIMP");
++        assert_eq!(strip_prefix("gimp"), "gimp");
++        let (x, f) = partition_names(&["gimp".to_string(), "flatpak:org.gimp.GIMP".to_string()]);
++        assert_eq!(x, vec!["gimp"]);
++        assert_eq!(f, vec!["org.gimp.GIMP"]);
++    }
++
++    #[test]
++    fn parses_search_without_header() {
++        let out = "org.gimp.GIMP\tGNU Image Manipulation Program\tCreate images and edit photographs\t2.10.38\tflathub\n\
++                   org.gimp.GIMP\tGNU Image Manipulation Program\tCreate images and edit photographs\t2.10.38\tflathub-beta\n\
++                   io.github.foo.Bar\tBar\t\t\tflathub,other\n";
++        let pkgs = parse_search_output(out);
++        assert_eq!(pkgs.len(), 2);
++        assert_eq!(pkgs[0].name, "flatpak:org.gimp.GIMP");
++        assert_eq!(pkgs[0].title(), "GNU Image Manipulation Program");
++        assert_eq!(pkgs[0].version, "2.10.38");
++        assert_eq!(pkgs[0].repository.as_deref(), Some("Flatpak (flathub)"));
++        assert!(!pkgs[0].installed);
++        assert!(pkgs[0].description_lower.contains("gnu image"));
++        assert_eq!(pkgs[1].repository.as_deref(), Some("Flatpak (flathub)"));
++    }
++
++    #[test]
++    fn parses_search_with_header_and_no_matches() {
++        let out = "Application ID\tName\tDescription\tVersion\tRemotes\n\
++                   org.mozilla.firefox\tFirefox\tFast, Private & Safe Web Browser\t133.0\tflathub\n";
++        let pkgs = parse_search_output(out);
++        assert_eq!(pkgs.len(), 1);
++        assert_eq!(pkgs[0].title(), "Firefox");
++        assert!(parse_search_output("No matches found\n").is_empty());
++    }
++
++    #[test]
++    fn parses_list() {
++        let out = "com.github.tchx84.Flatseal\tFlatseal\tManage Flatpak permissions\t2.3.0\tflathub\n\
++                   org.freedesktop.Platform\tFreedesktop Platform\t\t24.08\tflathub\n";
++        let pkgs = parse_list_output(out);
++        assert_eq!(pkgs.len(), 2);
++        assert!(pkgs[0].installed);
++        assert!(pkgs[0].is_flatpak());
++        assert_eq!(pkgs[0].title(), "Flatseal");
++    }
++
++    #[test]
++    fn parses_info() {
++        let out = "\nGIMP - Create images and edit photographs\n\n\
++                   \x20         ID: org.gimp.GIMP\n\
++                   \x20        Ref: app/org.gimp.GIMP/x86_64/stable\n\
++                   \x20    Version: 2.10.38\n\
++                   \x20    License: GPL-3.0+ AND LGPL-3.0+\n\
++                   \x20     Origin: flathub\n\
++                   \x20  Installed: 1.2 GB\n";
++        let info = parse_info_output(out);
++        assert_eq!(info.title.as_deref(), Some("GIMP"));
++        assert_eq!(
++            info.summary.as_deref(),
++            Some("Create images and edit photographs")
++        );
++        assert_eq!(
++            info.fields.get("Version").map(String::as_str),
++            Some("2.10.38")
++        );
++        assert_eq!(
++            info.fields.get("Origin").map(String::as_str),
++            Some("flathub")
++        );
++        assert_eq!(
++            info.fields.get("Installed").map(String::as_str),
++            Some("1.2 GB")
++        );
++        assert_eq!(
++            info.fields.get("Ref").map(String::as_str),
++            Some("app/org.gimp.GIMP/x86_64/stable")
++        );
++    }
++
++    #[test]
++    fn parses_sizes() {
++        assert_eq!(parse_human_size("1.2 GB"), Some(1_200_000_000));
++        assert_eq!(parse_human_size("350.5 MB"), Some(350_500_000));
++        assert_eq!(parse_human_size("12\u{a0}kB"), Some(12_000));
++        assert_eq!(parse_human_size("7 bytes"), Some(7));
++        assert_eq!(parse_human_size("?"), None);
++    }
++}
+diff --git a/src/helpers.rs b/src/helpers.rs
+index 6794cc9..ad278cd 100644
+--- a/src/helpers.rs
++++ b/src/helpers.rs
+@@ -169,6 +169,9 @@ pub(crate) fn query_installed_detail(
+     package: &str,
+     _installed_set: &HashSet<String>,
+ ) -> Result<InstalledDetail, String> {
++    if crate::flatpak::is_flatpak_name(package) {
++        return crate::flatpak::installed_detail(crate::flatpak::strip_prefix(package));
++    }
+     let mut detail = InstalledDetail::default();
+ 
+     match query_pkgsize_bytes(package) {
+@@ -197,6 +200,9 @@ pub(crate) fn query_installed_detail(
+ }
+ 
+ pub(crate) fn query_discover_detail(package: &str) -> Result<DiscoverDetail, String> {
++    if crate::flatpak::is_flatpak_name(package) {
++        return crate::flatpak::discover_detail(crate::flatpak::strip_prefix(package));
++    }
+     let info = query_repo_package_info(package)?;
+     let dependency_names = run_xbps_query_dependencies(package)
+         .unwrap_or_default()
+@@ -224,6 +230,9 @@ pub(crate) fn query_discover_detail(package: &str) -> Result<DiscoverDetail, Str
+ }
+ 
+ pub(crate) fn detail_download_bytes(package: &str) -> Option<u64> {
++    if crate::flatpak::is_flatpak_name(package) {
++        return None;
++    }
+     query_pkgsize_bytes(package).ok().flatten()
+ }
+ 
+@@ -283,3 +292,14 @@ fn build_spotlight_row(pkg: &PackageInfo) -> adw::ActionRow {
+ 
+     row
+ }
++
++/// Small "Flatpak" tag shown next to Flatpak apps in package lists.
++pub(crate) fn flatpak_badge() -> gtk::Label {
++    let label = gtk::Label::new(Some("Flatpak"));
++    label.add_css_class("caption-heading");
++    label.add_css_class("accent");
++    label.set_valign(gtk::Align::Center);
++    label.set_margin_end(12);
++    label.set_tooltip_text(Some("Installed through Flatpak"));
++    label
++}
+diff --git a/src/main.rs b/src/main.rs
+index 1a9a38f..c1f9a69 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,5 +1,6 @@
+ mod categories;
+ mod details;
++mod flatpak;
+ mod helpers;
+ mod mirrors;
+ mod settings;
+diff --git a/src/spotlight/cache.rs b/src/spotlight/cache.rs
+index 8ec61a3..0681a12 100644
+--- a/src/spotlight/cache.rs
++++ b/src/spotlight/cache.rs
+@@ -84,6 +84,7 @@ pub(crate) fn load_spotlight_cache_from_disk() -> SpotlightCache {
+             repository,
+             build_date,
+             first_seen,
++            display_name: None,
+         };
+ 
+         cache.packages.insert(info.name.clone(), info);
+diff --git a/src/spotlight/refresh.rs b/src/spotlight/refresh.rs
+index 6e07204..6e0d710 100644
+--- a/src/spotlight/refresh.rs
++++ b/src/spotlight/refresh.rs
+@@ -111,6 +111,7 @@ pub(crate) fn refresh_spotlight_cache(
+                 repository: repository.clone(),
+                 build_date: build_date_for_entry.clone(),
+                 first_seen: Some(now),
++                display_name: None,
+             });
+ 
+         let version_changed = entry.version != version;
+diff --git a/src/state/controller/app.rs b/src/state/controller/app.rs
+index 87ba8aa..a239567 100644
+--- a/src/state/controller/app.rs
++++ b/src/state/controller/app.rs
+@@ -872,14 +872,18 @@ impl AppController {
+ 
+         // Track the operation start
+         use crate::state::types::OperationType;
+-        let command = format!("xbps-install -y {}", package.name);
++        let command = if package.is_flatpak() {
++            format!("flatpak install -y {}", crate::flatpak::strip_prefix(&package.name))
++        } else {
++            format!("xbps-install -y {}", package.name)
++        };
+         self.start_operation_tracking(package.name.clone(), OperationType::Install, command);
+ 
+         self.rebuild_search_list();
+         self.refresh_discover_install_widgets();
+         self.restore_discover_focus_for(&package.name);
+ 
+-        let message = format!("Installing \"{}\"…", package.name);
++        let message = format!("Installing \"{}\"…", package.title());
+         self.set_footer_message(Some(&message));
+         let sender = self.sender.clone();
+         let package_name = package.name.clone();
+@@ -904,10 +908,14 @@ impl AppController {
+ 
+         // Track the operation start
+         use crate::state::types::OperationType;
+-        let command = format!("xbps-remove -y {}", package);
++        let command = if crate::flatpak::is_flatpak_name(&package) {
++            format!("flatpak uninstall -y {}", crate::flatpak::strip_prefix(&package))
++        } else {
++            format!("xbps-remove -y {}", package)
++        };
+         self.start_operation_tracking(package.clone(), OperationType::Remove, command);
+ 
+-        let message = format!("Removing \"{}\"…", package);
++        let message = format!("Removing \"{}\"…", crate::flatpak::strip_prefix(&package));
+         self.set_footer_message(Some(&message));
+ 
+         match origin {
+@@ -1000,7 +1008,7 @@ impl AppController {
+     pub(crate) fn start_remove(self: &Rc<Self>, package: String, origin: RemoveOrigin) {
+         if self.state.borrow().confirm_remove {
+             let pkg_clone = package.clone();
+-            let heading = format!("Remove \"{}\"?", package);
++            let heading = format!("Remove \"{}\"?", crate::flatpak::strip_prefix(&package));
+             let body = "The package and its data will be removed from this system.";
+             self.confirm_action(&heading, body, "Remove", move |controller| {
+                 controller.begin_remove(pkg_clone.clone(), origin);
+@@ -1320,8 +1328,8 @@ impl AppController {
+         let footer_message = match result {
+             Ok(command) => {
+                 if command.success() {
+-                    let message = format!("\"{}\" installed successfully.", package);
+-                    self.show_toast(&format!("Installed {}.", package));
++                    let message = format!("\"{}\" installed successfully.", crate::flatpak::strip_prefix(&package));
++                    self.show_toast(&format!("Installed {}.", crate::flatpak::strip_prefix(&package)));
+                     self.flag_installed_state(&package, true);
+                     self.refresh_installed_packages();
+                     Some(message)
+@@ -1331,16 +1339,16 @@ impl AppController {
+                         detail = command.stdout.trim();
+                     }
+                     let message = if detail.is_empty() {
+-                        format!("Failed to install \"{}\".", package)
++                        format!("Failed to install \"{}\".", crate::flatpak::strip_prefix(&package))
+                     } else {
+-                        format!("Failed to install \"{}\": {}", package, detail)
++                        format!("Failed to install \"{}\": {}", crate::flatpak::strip_prefix(&package), detail)
+                     };
+                     self.show_error_dialog("Install Failed", &message);
+                     Some(message)
+                 }
+             }
+             Err(err) => {
+-                let message = format!("Failed to install \"{}\": {}", package, err);
++                let message = format!("Failed to install \"{}\": {}", crate::flatpak::strip_prefix(&package), err);
+                 self.show_error_dialog("Install Failed", &message);
+                 Some(message)
+             }
+@@ -1378,9 +1386,9 @@ impl AppController {
+         let footer_message = match result {
+             Ok(command) => {
+                 if command.success() {
+-                    let message = format!("\"{}\" removed successfully.", package);
++                    let message = format!("\"{}\" removed successfully.", crate::flatpak::strip_prefix(&package));
+                     self.set_installed_status_message(Some(message.clone()));
+-                    self.show_toast(&format!("Removed {}.", package));
++                    self.show_toast(&format!("Removed {}.", crate::flatpak::strip_prefix(&package)));
+                     self.flag_installed_state(&package, false);
+                     self.refresh_installed_packages();
+                     Some(message)
+@@ -1390,16 +1398,16 @@ impl AppController {
+                         detail = command.stdout.trim();
+                     }
+                     let message = if detail.is_empty() {
+-                        format!("Failed to remove \"{}\".", package)
++                        format!("Failed to remove \"{}\".", crate::flatpak::strip_prefix(&package))
+                     } else {
+-                        format!("Failed to remove \"{}\": {}", package, detail)
++                        format!("Failed to remove \"{}\": {}", crate::flatpak::strip_prefix(&package), detail)
+                     };
+                     self.show_error_dialog("Removal Failed", &message);
+                     Some(message)
+                 }
+             }
+             Err(err) => {
+-                let message = format!("Failed to remove \"{}\": {}", package, err);
++                let message = format!("Failed to remove \"{}\": {}", crate::flatpak::strip_prefix(&package), err);
+                 self.show_error_dialog("Removal Failed", &message);
+                 Some(message)
+             }
+@@ -1438,13 +1446,13 @@ impl AppController {
+             Ok(command) => {
+                 if command.success() {
+                     let message = if packages.len() == 1 {
+-                        format!("\"{}\" removed successfully.", packages[0])
++                        format!("\"{}\" removed successfully.", crate::flatpak::strip_prefix(&packages[0]))
+                     } else {
+                         "Selected packages removed successfully.".to_string()
+                     };
+                     self.set_installed_status_message(Some(message.clone()));
+                     if packages.len() == 1 {
+-                        self.show_toast(&format!("Removed {}.", packages[0]));
++                        self.show_toast(&format!("Removed {}.", crate::flatpak::strip_prefix(&packages[0])));
+                     } else {
+                         self.show_toast("Selected packages removed.");
+                     }
+diff --git a/src/state/controller/discover.rs b/src/state/controller/discover.rs
+index f822f8d..0e8f67c 100644
+--- a/src/state/controller/discover.rs
++++ b/src/state/controller/discover.rs
+@@ -123,7 +123,7 @@ impl AppController {
+         let package = match self.current_search_selection() {
+             Some(pkg) if !pkg.installed => pkg,
+             Some(pkg) => {
+-                let message = format!("\"{}\" is already installed.", pkg.name);
++                let message = format!("\"{}\" is already installed.", pkg.title());
+                 self.set_discover_status(Some(&message));
+                 return;
+             }
+@@ -135,7 +135,7 @@ impl AppController {
+     fn request_install_for_package(self: &Rc<Self>, package: PackageInfo) {
+         if self.state.borrow().confirm_install {
+             let pkg_clone = package.clone();
+-            let heading = format!("Install \"{}\"?", package.name);
++            let heading = format!("Install \"{}\"?", package.title());
+             let body = "Nebula will install this package and any required dependencies.";
+             self.confirm_action(&heading, body, "Install", move |controller| {
+                 controller.begin_install(pkg_clone);
+@@ -456,6 +456,7 @@ impl AppController {
+                 repository: None,
+                 build_date: None,
+                 first_seen: None,
++                display_name: None,
+             });
+             state.discover_detail_package = Some(package.clone());
+         }
+@@ -632,7 +633,7 @@ impl AppController {
+     }
+ 
+     pub(crate) fn build_discover_row(self: &Rc<Self>, pkg: &PackageInfo) -> adw::ActionRow {
+-        let title = glib::markup_escape_text(&pkg.name);
++        let title = glib::markup_escape_text(&pkg.title());
+         let version_line = if pkg.version.is_empty() {
+             "Version —".to_string()
+         } else {
+@@ -708,6 +709,9 @@ impl AppController {
+             row.add_suffix(&status_indicator);
+         }
+ 
++        if pkg.is_flatpak() {
++            row.add_suffix(&crate::helpers::flatpak_badge());
++        }
+         row.add_suffix(&action_stack);
+         self.discover_buttons
+             .borrow_mut()
+@@ -854,7 +858,7 @@ impl AppController {
+                 .discover
+                 .detail_close_button
+                 .set_sensitive(true);
+-            self.widgets.discover.detail_name.set_text(&pkg.name);
++            self.widgets.discover.detail_name.set_text(&pkg.title());
+ 
+             action_stack.set_visible(true);
+             self.set_discover_row_buttons_visible(false);
+diff --git a/src/state/controller/installed.rs b/src/state/controller/installed.rs
+index 126201c..0d3f045 100644
+--- a/src/state/controller/installed.rs
++++ b/src/state/controller/installed.rs
+@@ -83,7 +83,7 @@ impl AppController {
+             let packages_clone = packages.clone();
+ 
+             let heading = if pkg_count == 1 {
+-                format!("Remove \"{}\"?", packages[0])
++                format!("Remove \"{}\"?", crate::flatpak::strip_prefix(&packages[0]))
+             } else {
+                 format!("Remove {} selected packages?", pkg_count)
+             };
+@@ -93,7 +93,7 @@ impl AppController {
+             } else {
+                 let package_list = packages.iter()
+                     .take(5)
+-                    .map(|s| s.as_str())
++                    .map(|s| crate::flatpak::strip_prefix(s))
+                     .collect::<Vec<_>>()
+                     .join(", ");
+ 
+@@ -569,7 +569,10 @@ impl AppController {
+                     .set_tooltip_text(None);
+             }
+ 
+-            self.widgets.installed.detail_pin_button.set_visible(true);
++            self.widgets
++                .installed
++                .detail_pin_button
++                .set_visible(!crate::flatpak::is_flatpak_name(&pkg));
+             self.widgets.installed.detail_pin_button.set_sensitive(
+                 !pin_in_progress && !remove_in_progress && !updates_busy && !refreshing,
+             );
+@@ -632,7 +635,7 @@ impl AppController {
+                 .installed
+                 .detail_close_button
+                 .set_sensitive(true);
+-            self.widgets.installed.detail_name.set_text(&pkg.name);
++            self.widgets.installed.detail_name.set_text(&pkg.title());
+ 
+             let (
+                 detail,
+@@ -656,7 +659,7 @@ impl AppController {
+             };
+ 
+             let pin_button = &self.widgets.installed.detail_pin_button;
+-            pin_button.set_visible(true);
++            pin_button.set_visible(!pkg.is_flatpak());
+             if pkg.pinned {
+                 pin_button.set_label("Unhold");
+                 pin_button.set_tooltip_text(Some(
+@@ -1308,7 +1311,7 @@ impl AppController {
+             )
+         };
+ 
+-        let title = glib::markup_escape_text(&pkg.name);
++        let title = glib::markup_escape_text(&pkg.title());
+         let version = glib::markup_escape_text(&pkg.version);
+         let description = if pkg.description.is_empty() {
+             glib::markup_escape_text("No description provided").to_string()
+@@ -1357,6 +1360,9 @@ impl AppController {
+         prefix_box.append(&check_button);
+         prefix_box.append(&icon);
+         row.add_prefix(&prefix_box);
++        if pkg.is_flatpak() {
++            row.add_suffix(&crate::helpers::flatpak_badge());
++        }
+ 
+         let show_actions = row_buttons_visible && !detail_open;
+         let actions_box = gtk::Box::builder()
+@@ -1425,7 +1431,9 @@ impl AppController {
+                 controller.execute_pin_toggle(package_name.clone(), !target_pinned);
+             }
+         });
+-        actions_box.append(&pin_button);
++        if !pkg.is_flatpak() {
++            actions_box.append(&pin_button);
++        }
+ 
+         let remove_button = gtk::Button::builder().label("Remove").build();
+         remove_button.add_css_class("destructive-action");
+diff --git a/src/types.rs b/src/types.rs
+index 3ad2066..70d4d2c 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -18,6 +18,9 @@ pub struct PackageInfo {
+     pub name_lower: Arc<str>,
+     pub version_lower: Arc<str>,
+     pub description_lower: Arc<str>,
++    /// Human-friendly name (used for Flatpak apps, whose `name` is the internal
++    /// `flatpak:<app-id>` key).
++    pub display_name: Option<String>,
+ }
+ 
+ pub(crate) fn lowercase_cache(value: &str) -> Arc<str> {
+@@ -38,6 +41,19 @@ impl PackageInfo {
+         self.description = description;
+         self.description_lower = lowercase_cache(&self.description);
+     }
++
++    /// True when this entry is a Flatpak application rather than an XBPS package.
++    pub(crate) fn is_flatpak(&self) -> bool {
++        crate::flatpak::is_flatpak_name(&self.name)
++    }
++
++    /// Name to show in the interface.
++    pub(crate) fn title(&self) -> String {
++        match &self.display_name {
++            Some(display) if !display.is_empty() => display.clone(),
++            _ => crate::flatpak::strip_prefix(&self.name).to_string(),
++        }
++    }
+ }
+ 
+ #[derive(Debug, Clone)]
+diff --git a/src/xbps/commands.rs b/src/xbps/commands.rs
+index 87b1988..8ae2000 100644
+--- a/src/xbps/commands.rs
++++ b/src/xbps/commands.rs
+@@ -105,7 +105,12 @@ pub(crate) fn run_xbps_query_search(query: &str) -> Result<Vec<PackageInfo>, Str
+     }
+ 
+     let stdout = String::from_utf8_lossy(&output.stdout);
+-    Ok(parse_query_output(&stdout))
++    let mut packages = parse_query_output(&stdout);
++    match crate::flatpak::search(query) {
++        Ok(apps) => packages.extend(apps),
++        Err(err) => eprintln!("Flatpak search failed: {}", err),
++    }
++    Ok(packages)
+ }
+ 
+ pub(crate) fn run_xbps_list_installed() -> Result<Vec<PackageInfo>, String> {
+@@ -120,10 +125,18 @@ pub(crate) fn run_xbps_list_installed() -> Result<Vec<PackageInfo>, String> {
+     }
+ 
+     let stdout = String::from_utf8_lossy(&output.stdout);
+-    Ok(parse_installed_output(&stdout))
++    let mut packages = parse_installed_output(&stdout);
++    match crate::flatpak::list_installed() {
++        Ok(apps) => packages.extend(apps),
++        Err(err) => eprintln!("Listing Flatpak apps failed: {}", err),
++    }
++    Ok(packages)
+ }
+ 
+ pub(crate) fn run_xbps_install(package: &str) -> Result<CommandResult, String> {
++    if crate::flatpak::is_flatpak_name(package) {
++        return crate::flatpak::install(crate::flatpak::strip_prefix(package));
++    }
+     let mut args = install_repository_args();
+     args.push("-y".to_string());
+     args.push(package.to_string());
+@@ -144,10 +157,45 @@ pub(crate) fn run_xbps_remove_packages(packages: &[String]) -> Result<CommandRes
+         });
+     }
+ 
+-    let mut args = vec!["-y"];
+-    let package_refs: Vec<&str> = packages.iter().map(|pkg| pkg.as_str()).collect();
+-    args.extend(package_refs);
+-    run_privileged_command("xbps-remove", &args)
++    let (xbps_packages, flatpak_apps) = crate::flatpak::partition_names(packages);
++
++    let mut results = Vec::new();
++    if !xbps_packages.is_empty() {
++        let mut args = vec!["-y"];
++        let package_refs: Vec<&str> = xbps_packages.iter().map(|pkg| pkg.as_str()).collect();
++        args.extend(package_refs);
++        results.push(run_privileged_command("xbps-remove", &args)?);
++    }
++    if !flatpak_apps.is_empty() {
++        results.push(crate::flatpak::uninstall(&flatpak_apps)?);
++    }
++    Ok(merge_command_results(results))
++}
++
++/// Combine several command results into one: success only if all succeeded.
++fn merge_command_results(results: Vec<CommandResult>) -> CommandResult {
++    let mut merged = CommandResult {
++        code: Some(0),
++        stdout: String::new(),
++        stderr: String::new(),
++    };
++    for result in results {
++        if !result.success() {
++            merged.code = result.code.or(Some(1));
++        }
++        for (target, text) in [
++            (&mut merged.stdout, result.stdout),
++            (&mut merged.stderr, result.stderr),
++        ] {
++            if !text.trim().is_empty() {
++                if !target.is_empty() {
++                    target.push('\n');
++                }
++                target.push_str(text.trim_end());
++            }
++        }
++    }
++    merged
+ }
+ 
+ pub(crate) fn run_xbps_query_required_by(package: &str) -> Result<Vec<String>, String> {
+@@ -474,6 +522,7 @@ pub(crate) fn query_repo_package_info(name: &str) -> Result<PackageInfo, String>
+         repository: None,
+         build_date: None,
+         first_seen: None,
++        display_name: None,
+     })
+ }
+ 
+@@ -515,11 +564,20 @@ pub(crate) fn run_xbps_remove_cache() -> Result<CommandResult, String> {
+     run_privileged_command("xbps-remove", &["-o"])
+ }
+ 
++fn reject_flatpak_hold(package: &str) -> Result<(), String> {
++    if crate::flatpak::is_flatpak_name(package) {
++        return Err("Holding is not supported for Flatpak apps.".to_string());
++    }
++    Ok(())
++}
++
+ pub(crate) fn run_xbps_pkgdb_hold(package: &str) -> Result<CommandResult, String> {
++    reject_flatpak_hold(package)?;
+     run_privileged_command("xbps-pkgdb", &["-m", "hold", package])
+ }
+ 
+ pub(crate) fn run_xbps_pkgdb_unhold(package: &str) -> Result<CommandResult, String> {
++    reject_flatpak_hold(package)?;
+     run_privileged_command("xbps-pkgdb", &["-m", "unhold", package])
+ }
+ 
+@@ -706,6 +764,7 @@ fn add_update_entry(
+             download_bytes: None,
+             repository: None,
+             build_date: None,
++            display_name: None,
+             first_seen: None,
+         }
+     });
+diff --git a/src/xbps/parser.rs b/src/xbps/parser.rs
+index 4268bab..f4566a2 100644
+--- a/src/xbps/parser.rs
++++ b/src/xbps/parser.rs
+@@ -144,6 +144,7 @@ pub(crate) fn parse_query_output(output: &str) -> Vec<PackageInfo> {
+             repository: None,
+             build_date: None,
+             first_seen: None,
++            display_name: None,
+         };
+ 
+         // Use package name as key to deduplicate entries from multiple mirrors
+@@ -190,6 +191,7 @@ pub(crate) fn parse_installed_output(output: &str) -> Vec<PackageInfo> {
+                 download_bytes: None,
+                 repository: None,
+                 build_date: None,
++                display_name: None,
+                 first_seen: None,
+             })
+         })
+-- 
+2.43.0
+
